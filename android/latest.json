@@ -1,0 +1,10 @@
+{
+  "versionCode": 400911,
+  "versionName": "0.0.51",
+  "commit": "e29943c45fed5a27120dafe306258fc856703877",
+  "apkUrl": "https://github.com/K7Adam/orca-releases/releases/download/android-400911/orca-android-400911.apk",
+  "watchApkUrl": "https://github.com/K7Adam/orca-releases/releases/download/android-400911/orca-watch-400911.apk",
+  "sha256": "5be948bb2e9929a0f54b53fac50b1091eb43a655423a91b1f372d834864a54d7",
+  "bytes": 45956159,
+  "releaseUrl": "https://github.com/K7Adam/orca-releases/releases/tag/android-400911"
+}
