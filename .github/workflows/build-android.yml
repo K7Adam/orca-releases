@@ -1,0 +1,179 @@
+name: Build Orca Android
+
+# Builds the private fork (K7Adam/orca) whenever its branch moves and publishes the APKs here.
+# The source is read through a read-only deploy key; this repo only ever holds binaries.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if the source branch has not moved since the last release
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-android
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: K7Adam/orca
+  SOURCE_BRANCH: K7Adam/orca-wear
+  # Same rule as mobile/orca-fork-app-config.js: minutes since 2026-01-01 at the commit's time.
+  VERSION_CODE_EPOCH_SECONDS: '1767225600'
+  # The installed apps are signed with Expo's template debug keystore; any other key cannot update them.
+  DEBUG_KEYSTORE_SHA256: 221e0a3106aa4c3ccc154e0a418b55020b3f9ea6e84f92e8749cd9e2f39f5e58
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      build: ${{ steps.head.outputs.build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare the source branch with the last release
+        id: head
+        env:
+          DEPLOY_KEY: ${{ secrets.ORCA_SOURCE_DEPLOY_KEY }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          sha=$(git ls-remote "git@github.com:${SOURCE_REPO}.git" "refs/heads/${SOURCE_BRANCH}" | cut -f1)
+          [ -n "$sha" ] || { echo "Source branch not found" >&2; exit 1; }
+          last=$(jq -r '.commit // ""' android/latest.json 2>/dev/null || true)
+          build=false
+          if [ "$sha" != "$last" ] || [ "$FORCE" = "true" ]; then build=true; fi
+          echo "source ${sha:0:12}, last release ${last:0:12}, build=$build"
+          { echo "sha=$sha"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout releases
+        uses: actions/checkout@v6
+        with:
+          path: releases
+
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          ssh-key: ${{ secrets.ORCA_SOURCE_DEPLOY_KEY }}
+          path: source
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Build identity
+        id: version
+        working-directory: source
+        run: |
+          set -euo pipefail
+          committed=$(git log -1 --format=%ct)
+          code=$(( (committed - VERSION_CODE_EPOCH_SECONDS) / 60 ))
+          name=$(jq -r .expo.version mobile/app.json)
+          echo "ORCA_FORK_VERSION_CODE=$code" >> "$GITHUB_ENV"
+          { echo "code=$code"; echo "name=$name"; } >> "$GITHUB_OUTPUT"
+          echo "Orca $name, build $code"
+
+      - name: Install mobile dependencies
+        working-directory: source/mobile
+        run: |
+          set -euo pipefail
+          npm install -g "pnpm@$(jq -r '.packageManager | split("@")[1] | split("+")[0]' package.json)"
+          pnpm install --frozen-lockfile
+
+      - name: Firebase client config
+        working-directory: source/mobile
+        env:
+          GOOGLE_SERVICES_DEV_JSON: ${{ secrets.GOOGLE_SERVICES_DEV_JSON }}
+        run: printf '%s' "$GOOGLE_SERVICES_DEV_JSON" > google-services.dev.json
+
+      - name: Expo prebuild
+        working-directory: source/mobile
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Check the signing key
+        working-directory: source/mobile
+        run: echo "$DEBUG_KEYSTORE_SHA256  android/app/debug.keystore" | sha256sum -c -
+
+      - name: Build the watch app
+        working-directory: source/mobile/wear
+        run: ./gradlew --no-daemon -q :app:assembleProfile -PorcaVersionCode="$ORCA_FORK_VERSION_CODE"
+
+      - name: Build the phone app (bundles the watch app)
+        working-directory: source/mobile/android
+        # arm64 only and compressed native libraries: about 30 MB instead of 135 MB.
+        run: >
+          ./gradlew --no-daemon -q :app:assembleRelease
+          -PreactNativeArchitectures=arm64-v8a
+          -Pexpo.useLegacyPackaging=true
+
+      - name: Collect artifacts
+        id: artifacts
+        env:
+          CODE: ${{ steps.version.outputs.code }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp source/mobile/android/app/build/outputs/apk/release/app-release.apk "out/orca-android-$CODE.apk"
+          cp source/mobile/wear/app/build/outputs/apk/profile/app-profile.apk "out/orca-watch-$CODE.apk"
+          unzip -l "out/orca-android-$CODE.apk" | grep -q 'assets/orca-watch/app-profile.apk' \
+            || { echo "phone APK does not carry the watch app" >&2; exit 1; }
+          (cd out && sha256sum *.apk > SHA256SUMS)
+          cat out/SHA256SUMS
+          echo "bytes=$(wc -c < "out/orca-android-$CODE.apk" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "out/orca-android-$CODE.apk" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release and manifest
+        working-directory: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODE: ${{ steps.version.outputs.code }}
+          NAME: ${{ steps.version.outputs.name }}
+          SHA: ${{ needs.check.outputs.sha }}
+          BYTES: ${{ steps.artifacts.outputs.bytes }}
+          APK_SHA256: ${{ steps.artifacts.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          tag="android-$CODE"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag"
+          notes=$(printf 'Orca %s, build %s (source %s).\n\nInstall `orca-android-%s.apk` on the phone; it carries the watch app and updates the watch itself. `orca-watch-%s.apk` is the same watch build for a manual install.\n\nSize %s bytes, SHA-256 `%s`.\n' \
+            "$NAME" "$CODE" "${SHA:0:12}" "$CODE" "$CODE" "$BYTES" "$APK_SHA256")
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" ../out/* --clobber
+          else
+            gh release create "$tag" ../out/* --title "Orca $NAME · build $CODE" --notes "$notes" --latest
+          fi
+          mkdir -p android
+          jq -n --argjson code "$CODE" --arg name "$NAME" --arg commit "$SHA" \
+            --arg apk "$base/orca-android-$CODE.apk" --arg watch "$base/orca-watch-$CODE.apk" \
+            --arg sha256 "$APK_SHA256" --argjson bytes "$BYTES" \
+            --arg release "https://github.com/${GITHUB_REPOSITORY}/releases/tag/$tag" \
+            '{versionCode: $code, versionName: $name, commit: $commit, apkUrl: $apk, watchApkUrl: $watch, sha256: $sha256, bytes: $bytes, releaseUrl: $release}' \
+            > android/latest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add android/latest.json
+          git commit -m "Release build $CODE"
+          git push
