@@ -176,4 +176,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add android/latest.json
           git commit -m "Release build $CODE"
-          git push
+          # Back-to-back runs both write the manifest; rebase onto the newer one (newest build wins).
+          for attempt in 1 2 3; do
+            git push && break
+            git pull --rebase -X theirs || { git checkout --theirs android/latest.json; git add android/latest.json; GIT_EDITOR=true git rebase --continue; }
+          done
