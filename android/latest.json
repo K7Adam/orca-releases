@@ -1,10 +1,10 @@
 {
-  "versionCode": 400958,
+  "versionCode": 401032,
   "versionName": "0.0.51",
-  "commit": "d2ade4b3cee7955fd1f84578a46ad3ef08864698",
-  "apkUrl": "https://github.com/K7Adam/orca-releases/releases/download/android-400958/orca-android-400958.apk",
-  "watchApkUrl": "https://github.com/K7Adam/orca-releases/releases/download/android-400958/orca-watch-400958.apk",
-  "sha256": "0563df3f9e989ec6efd25fe3a6beb2302d98240f7f1510494b1a59fbe5b14686",
-  "bytes": 45956439,
-  "releaseUrl": "https://github.com/K7Adam/orca-releases/releases/tag/android-400958"
+  "commit": "5938f7c93997104c0164e291a6ffed1e679e3ccc",
+  "apkUrl": "https://github.com/K7Adam/orca-releases/releases/download/android-401032/orca-android-401032.apk",
+  "watchApkUrl": "https://github.com/K7Adam/orca-releases/releases/download/android-401032/orca-watch-401032.apk",
+  "sha256": "095627f6259ae109bca3d5830a3c58f0e30c7ef942840147097ee1edd47939bf",
+  "bytes": 45956940,
+  "releaseUrl": "https://github.com/K7Adam/orca-releases/releases/tag/android-401032"
 }
