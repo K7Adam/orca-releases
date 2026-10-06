@@ -123,7 +123,7 @@ jobs:
 
       - name: Build the phone app (bundles the watch app)
         working-directory: source/mobile/android
-        # arm64 only and compressed native libraries: about 30 MB instead of 135 MB.
+        # arm64 only and compressed native libraries: about 46 MB instead of 135 MB.
         run: >
           ./gradlew --no-daemon -q :app:assembleRelease
           -PreactNativeArchitectures=arm64-v8a
