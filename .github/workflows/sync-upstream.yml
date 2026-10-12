@@ -1,0 +1,157 @@
+name: Sync fork with upstream
+
+# Merges stablyai/orca main into the fork branch, but only when the merge is conflict-free and the
+# fork's gates pass; then the phone, watch and desktop builds pick the new commit up on their own.
+# Anything else (a conflict, a red gate) pushes nothing and opens an issue here, so a person resolves
+# it with the sync-orca-upstream procedure. The mirror branch `main` is fast-forwarded alongside.
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  SOURCE_REPO: K7Adam/orca
+  SOURCE_BRANCH: K7Adam/orca-wear
+  UPSTREAM_URL: https://github.com/stablyai/orca.git
+  # Hooks reformat staged upstream files; a bot merge must carry upstream's bytes unchanged.
+  HUSKY: '0'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Clone the fork and fetch upstream
+        id: fetch
+        env:
+          WRITE_KEY: ${{ secrets.ORCA_SOURCE_WRITE_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$WRITE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone -q --filter=blob:none --branch "$SOURCE_BRANCH" "git@github.com:${SOURCE_REPO}.git" src
+          cd src
+          git config user.name 'orca-fork-sync[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch -q --filter=blob:none upstream main
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "fork is $behind commits behind upstream"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+
+      - name: Merge
+        id: merge
+        if: steps.fetch.outputs.behind != '0'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if git merge --no-ff --no-edit upstream/main > ../merge.log 2>&1; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > ../conflicts.txt || true
+            git merge --abort || true
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+          cat ../merge.log | tail -5
+
+      - name: Setup pnpm
+        if: steps.merge.outputs.clean == 'true'
+        uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - uses: actions/setup-node@v6
+        if: steps.merge.outputs.clean == 'true'
+        with:
+          node-version-file: src/package.json
+
+      # A clean textual merge of the lockfiles can still be inconsistent; regenerate rather than
+      # trust it, which also keeps the fork's own dependencies (e.g. @xterm/headless) in place.
+      - name: Install and reconcile lockfiles
+        id: install
+        if: steps.merge.outputs.clean == 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --ignore-scripts || pnpm install --ignore-scripts
+          (cd mobile && (pnpm install --frozen-lockfile || pnpm install))
+          if ! git diff --quiet -- pnpm-lock.yaml mobile/pnpm-lock.yaml; then
+            git add pnpm-lock.yaml mobile/pnpm-lock.yaml
+            git commit -q -m "chore: regenerate lockfiles after upstream sync"
+            echo "Lockfiles regenerated"
+          fi
+
+      - name: Gate - typecheck
+        id: typecheck
+        if: steps.merge.outputs.clean == 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm tc
+          (cd mobile && pnpm exec tsc --noEmit -p . && pnpm run check:tests-typecheck)
+
+      - name: Gate - fork tests
+        id: tests
+        if: steps.merge.outputs.clean == 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          node node_modules/vitest/vitest.mjs run --config config/vitest.config.ts \
+            src/main/updater src/main/updater- src/main/devin src/main/agent-hooks \
+            src/main/native-chat/agent-session-wire/structured-agent-session-status \
+            src/shared/agent-session
+          (cd mobile && pnpm exec vitest run src/wear src/notifications src/settings src/transport src/app-update)
+
+      - name: Push
+        if: steps.merge.outputs.clean == 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git push -q origin "HEAD:refs/heads/${SOURCE_BRANCH}"
+          # The mirror only ever fast-forwards; anything else means someone wrote to it.
+          git push -q origin "upstream/main:refs/heads/main" || echo "::warning::mirror main did not fast-forward"
+          echo "Pushed $(git rev-parse --short HEAD) to ${SOURCE_BRANCH}"
+
+      - name: Close a resolved sync issue
+        if: success() && (steps.fetch.outputs.behind == '0' || steps.merge.outputs.clean == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync --state open --json number --jq '.[].number' 2>/dev/null || true); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "The fork is in sync with upstream again."
+          done
+
+      - name: Report a sync that needs a person
+        if: always() && steps.fetch.outputs.behind != '0' && (steps.merge.outputs.clean == 'false' || failure())
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLEAN: ${{ steps.merge.outputs.clean }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+        run: |
+          set -euo pipefail
+          if [ "$CLEAN" = "false" ]; then
+            reason="The merge has conflicts in:"$'\n\n'"$(sed 's/^/- `/; s/$/`/' conflicts.txt)"
+          else
+            reason="The merge was clean, but a gate failed (typecheck, tests or push). Nothing was pushed."
+          fi
+          body="The fork is ${BEHIND} commits behind stablyai/orca and the automatic sync stopped."$'\n\n'"${reason}"$'\n\n'"Run: ${RUN_URL}"$'\n\n'"Resolve with the sync-orca-upstream procedure."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh label create upstream-sync --repo "$GITHUB_REPOSITORY" --color B60205 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --label upstream-sync \
+              --title "Upstream sync needs a manual merge" --body "$body"
+          fi
