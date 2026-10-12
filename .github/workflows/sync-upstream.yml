@@ -69,6 +69,7 @@ jobs:
         uses: pnpm/setup@v2
         with:
           install: false
+          package-json-file: src/package.json
 
       - uses: actions/setup-node@v6
         if: steps.merge.outputs.clean == 'true'
